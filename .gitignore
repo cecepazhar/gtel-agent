@@ -1,0 +1,9 @@
+/target
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/*.db
+agent_queue.db
+telemetry_queue.db
+agent_config.json
