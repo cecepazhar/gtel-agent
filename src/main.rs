@@ -5,6 +5,7 @@ use telemetry_agent::client::TelemetryClient;
 use telemetry_agent::collector;
 use telemetry_agent::config::Config;
 use telemetry_agent::db::{seed_sample_reporting_db, QueueDb, ReportingDbReader};
+use telemetry_agent::health::{calculate_status, collect_health_report};
 use telemetry_agent::hwid::HardwareFingerprint;
 
 #[derive(Parser)]
@@ -51,6 +52,9 @@ enum Commands {
         )]
         seed: bool,
     },
+
+    #[command(about = "Display current application health report")]
+    Health,
 }
 
 #[tokio::main]
@@ -71,6 +75,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::TestDb { path, seed } => {
             cmd_test_db(&config, path.as_deref(), seed)?;
+        }
+        Commands::Health => {
+            cmd_health(&config).await?;
         }
     }
 
@@ -313,6 +320,50 @@ fn cmd_test_db(
             println!("Status: FAILED TO READ DATA");
             println!("Error: {}", e);
         }
+    }
+    println!("============================================================");
+
+    Ok(())
+}
+
+async fn cmd_health(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let queue_db = QueueDb::new(&config.queue_db_path)?;
+
+    let detected_errors = if Path::new(&config.db_path).exists() {
+        let rep_data = ReportingDbReader::read(&config.db_path)?;
+        rep_data
+            .detected_errors
+            .into_iter()
+            .map(|e| collector::DetectedError {
+                timestamp: e.timestamp,
+                module: e.module,
+                error_message: e.error_message,
+            })
+            .collect()
+    } else if config.enable_mock_if_missing {
+        collector::generate_mock_metrics().2
+    } else {
+        Vec::new()
+    };
+
+    let report = collect_health_report(config, &queue_db, &detected_errors).await?;
+    let status = calculate_status(&report);
+
+    println!("============================================================");
+    println!("           Gerlink TelemetryAgent Health Report             ");
+    println!("============================================================");
+    println!("Status               : {}", status);
+    println!("Uptime               : {:.2} seconds", report.agent_uptime_seconds);
+    println!("Memory RSS           : {:.2} MB", report.memory_rss_mb);
+    println!("CPU Usage            : {:.2} %", report.cpu_pct);
+    println!("Last Sync At         : {:?}", report.last_sync_at);
+    println!("Queue Depth          : {}", report.queue_depth);
+    println!("DB Size              : {:.2} MB", report.db_size_mb);
+    println!("Errors (24h)         : {}", report.error_count_24h);
+    println!("Version              : {}", report.version);
+    println!("Connected to Server  : {}", report.is_connected_to_server);
+    if let Some(ref msg) = report.last_error_message {
+        println!("Last Error Message   : {}", msg);
     }
     println!("============================================================");
 

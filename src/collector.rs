@@ -45,6 +45,8 @@ pub struct TelemetryPayload {
     pub usage_metrics: UsageMetrics,
     pub productivity_metrics: ProductivityMetrics,
     pub detected_errors: Vec<DetectedError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_report: Option<crate::health::AgentHealthReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,10 +115,11 @@ pub fn collect_telemetry(config: &Config, hwid: &str) -> Result<TelemetryPayload
         usage_metrics,
         productivity_metrics,
         detected_errors,
+        health_report: None,
     })
 }
 
-fn generate_mock_metrics() -> (UsageMetrics, ProductivityMetrics, Vec<DetectedError>) {
+pub fn generate_mock_metrics() -> (UsageMetrics, ProductivityMetrics, Vec<DetectedError>) {
     let now = Utc::now().to_rfc3339();
     let usage = UsageMetrics {
         usage_count: 142,
