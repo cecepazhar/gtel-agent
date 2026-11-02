@@ -1,5 +1,5 @@
 use crate::collector::DetectedError;
-use crate::config::Config;
+use crate::config::{Config, Profile};
 use crate::db::QueueDb;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -40,9 +40,10 @@ impl std::fmt::Display for HealthStatus {
     }
 }
 
-/// Collect a live health snapshot for the running agent.
-pub async fn collect_health_report(
+/// Collect a live health snapshot for a specific brand profile.
+pub async fn collect_health_report_for_profile(
     config: &Config,
+    profile: &Profile,
     queue_db: &QueueDb,
     detected_errors: &[DetectedError],
 ) -> Result<AgentHealthReport, Box<dyn std::error::Error>> {
@@ -52,8 +53,8 @@ pub async fn collect_health_report(
     let queue_depth = stats.unsynced;
     let last_sync_at = stats.last_attempt.clone();
 
-    let db_size_mb = if Path::new(&config.db_path).exists() {
-        let meta = fs::metadata(&config.db_path)?;
+    let db_size_mb = if Path::new(&profile.db_path).exists() {
+        let meta = fs::metadata(&profile.db_path)?;
         meta.len() as f64 / (1024.0 * 1024.0)
     } else {
         0.0
@@ -78,10 +79,23 @@ pub async fn collect_health_report(
         queue_depth,
         db_size_mb,
         error_count_24h,
-        version: config.software_version.clone(),
+        version: profile.software_version.clone(),
         is_connected_to_server,
         last_error_message,
     })
+}
+
+/// Backwards compatibility: collect health for the first active profile.
+pub async fn collect_health_report(
+    config: &Config,
+    queue_db: &QueueDb,
+    detected_errors: &[DetectedError],
+) -> Result<AgentHealthReport, Box<dyn std::error::Error>> {
+    let profiles = config.active_profiles();
+    let first = profiles
+        .first()
+        .ok_or_else(|| "No active profile found in config".to_string())?;
+    collect_health_report_for_profile(config, first, queue_db, detected_errors).await
 }
 
 pub fn calculate_status(report: &AgentHealthReport) -> HealthStatus {

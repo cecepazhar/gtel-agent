@@ -1,0 +1,46 @@
+{
+  "server_url": "https://apig.fathforce.com/v1/update/check",
+  "hospital_name": "RSUD Dr. Soetomo",
+  "region": "Jawa Timur",
+  "city": "Surabaya",
+  "room_name": "Poli THT - Ruang Tindakan 2",
+  "latitude": -7.2575,
+  "longitude": 112.7521,
+  "interval_secs": 300,
+  "enable_mock_if_missing": true,
+  "profiles": [
+    {
+      "software_name": "GLESCOPE",
+      "software_version": "1.2.0",
+      "db_path": "D:\\GLESCOPE_DB\\telemetry.db",
+      "queue_db_path": "./agent_queue_glescope.db",
+      "device_id": null
+    },
+    {
+      "software_name": "ANTECH",
+      "software_version": "1.2.0",
+      "db_path": "D:\\ANTECH_DB\\telemetry.db",
+      "queue_db_path": "./agent_queue_antech.db",
+      "device_id": null
+    },
+    {
+      "software_name": "EASTTECH",
+      "software_version": "1.2.0",
+      "db_path": "D:\\EASTTECH_DB\\telemetry.db",
+      "queue_db_path": "./agent_queue_easttech.db",
+      "device_id": null
+    },
+    {
+      "software_name": "ZEUS",
+      "software_version": "1.2.0",
+      "db_path": "D:\\ZEUS_DB\\telemetry.db",
+      "queue_db_path": "./agent_queue_zeus.db",
+      "device_id": null
+    }
+  ],
+  "device_id": null,
+  "software_name": null,
+  "software_version": null,
+  "db_path": null,
+  "queue_db_path": null
+}

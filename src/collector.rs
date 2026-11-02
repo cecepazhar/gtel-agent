@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, Profile};
 use crate::db::ReportingDbReader;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -58,10 +58,14 @@ pub struct ServerResponse {
     pub server_timestamp: Option<String>,
 }
 
-/// Collects telemetry snapshot from reporting database or mock fallback
-pub fn collect_telemetry(config: &Config, hwid: &str) -> Result<TelemetryPayload, Box<dyn std::error::Error>> {
-    let device_id = config.get_effective_device_id(hwid);
-    let db_path = &config.db_path;
+/// Collects telemetry snapshot for a specific brand profile.
+pub fn collect_telemetry_for_profile(
+    config: &Config,
+    profile: &Profile,
+    hwid: &str,
+) -> Result<TelemetryPayload, Box<dyn std::error::Error>> {
+    let device_id = config.get_effective_device_id(profile, hwid);
+    let db_path = &profile.db_path;
 
     let (usage_metrics, productivity_metrics, detected_errors) = if Path::new(db_path).exists() {
         let rep_data = ReportingDbReader::read(db_path)?;
@@ -94,7 +98,8 @@ pub fn collect_telemetry(config: &Config, hwid: &str) -> Result<TelemetryPayload
         generate_mock_metrics()
     } else {
         return Err(format!(
-            "Reporting SQLite database not found at '{}' and mock generator is disabled",
+            "Reporting SQLite database for {} not found at '{}' and mock generator is disabled",
+            profile.label(),
             db_path
         )
         .into());
@@ -102,8 +107,8 @@ pub fn collect_telemetry(config: &Config, hwid: &str) -> Result<TelemetryPayload
 
     Ok(TelemetryPayload {
         device_id,
-        software_name: config.software_name.to_string(),
-        software_version: config.software_version.clone(),
+        software_name: profile.software_name.to_string(),
+        software_version: profile.software_version.clone(),
         hospital_info: HospitalInfo {
             hospital_name: config.hospital_name.clone(),
             region: config.region.clone(),
@@ -117,6 +122,18 @@ pub fn collect_telemetry(config: &Config, hwid: &str) -> Result<TelemetryPayload
         detected_errors,
         health_report: None,
     })
+}
+
+/// Backwards compatibility: collect for the first active profile.
+pub fn collect_telemetry(
+    config: &Config,
+    hwid: &str,
+) -> Result<TelemetryPayload, Box<dyn std::error::Error>> {
+    let profiles = config.active_profiles();
+    let first = profiles
+        .first()
+        .ok_or_else(|| "No active profile found in config".to_string())?;
+    collect_telemetry_for_profile(config, first, hwid)
 }
 
 pub fn generate_mock_metrics() -> (UsageMetrics, ProductivityMetrics, Vec<DetectedError>) {
@@ -191,7 +208,8 @@ mod tests {
   ]
 }"#;
 
-        let parsed: TelemetryPayload = serde_json::from_str(sample_json).expect("Deserialization failed");
+        let parsed: TelemetryPayload =
+            serde_json::from_str(sample_json).expect("Deserialization failed");
         assert_eq!(parsed.device_id, "DEV-GLS-SUB-001");
         assert_eq!(parsed.software_name, "GLESCOPE");
         assert_eq!(parsed.usage_metrics.usage_count, 142);
@@ -200,7 +218,8 @@ mod tests {
         assert_eq!(parsed.detected_errors[0].module, "video-stream");
 
         let serialized = serde_json::to_string(&parsed).expect("Serialization failed");
-        let re_parsed: TelemetryPayload = serde_json::from_str(&serialized).expect("Re-parse failed");
+        let re_parsed: TelemetryPayload =
+            serde_json::from_str(&serialized).expect("Re-parse failed");
         assert_eq!(parsed, re_parsed);
     }
 
@@ -217,6 +236,9 @@ mod tests {
         assert_eq!(resp.status, "success");
         assert!(!resp.update_available);
         assert_eq!(resp.latest_version, "1.2.0");
-        assert_eq!(resp.server_timestamp, Some("2026-10-28T03:00:00Z".to_string()));
+        assert_eq!(
+            resp.server_timestamp,
+            Some("2026-10-28T03:00:00Z".to_string())
+        );
     }
 }

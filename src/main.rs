@@ -3,9 +3,9 @@ use std::path::Path;
 use std::time::Duration;
 use telemetry_agent::client::TelemetryClient;
 use telemetry_agent::collector;
-use telemetry_agent::config::Config;
+use telemetry_agent::config::{Config, Profile, SoftwareName};
 use telemetry_agent::db::{seed_sample_reporting_db, QueueDb, ReportingDbReader};
-use telemetry_agent::health::{calculate_status, collect_health_report};
+use telemetry_agent::health::{calculate_status, collect_health_report_for_profile};
 use telemetry_agent::hwid::HardwareFingerprint;
 
 #[derive(Parser)]
@@ -23,7 +23,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "Start daemon loop to periodically collect and dispatch telemetry")]
+    #[command(about = "Start daemon loop to periodically collect and dispatch telemetry for all profiles")]
     Run {
         #[arg(
             short,
@@ -33,11 +33,14 @@ enum Commands {
         interval: Option<u64>,
     },
 
-    #[command(about = "Execute immediate single probe & dispatch")]
-    SendOnce,
+    #[command(about = "Execute immediate single probe & dispatch for all profiles (or a specific brand)")]
+    SendOnce {
+        #[arg(short, long, help = "Filter to a specific brand: GLESCOPE, ANTECH, EASTTECH, ZEUS")]
+        brand: Option<String>,
+    },
 
     #[command(
-        about = "Display agent status, hardware fingerprint, queue metrics and configuration"
+        about = "Display agent status, hardware fingerprint, queue metrics and all brand profiles"
     )]
     Status,
 
@@ -53,8 +56,14 @@ enum Commands {
         seed: bool,
     },
 
-    #[command(about = "Display current application health report")]
+    #[command(about = "Display current application health report for each brand")]
     Health,
+
+    #[command(about = "Generate a default multi-brand agent_config.json containing Glescope, Antech, Easttech, and Zeus")]
+    InitConfig {
+        #[arg(short, long, default_value = "agent_config.json", help = "Output filename")]
+        output: String,
+    },
 }
 
 #[tokio::main]
@@ -67,8 +76,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tick_secs = interval.unwrap_or(config.interval_secs);
             cmd_run(&config, tick_secs).await?;
         }
-        Commands::SendOnce => {
-            cmd_send_once(&config).await?;
+        Commands::SendOnce { brand } => {
+            cmd_send_once(&config, brand.as_deref()).await?;
         }
         Commands::Status => {
             cmd_status(&config)?;
@@ -79,6 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Health => {
             cmd_health(&config).await?;
         }
+        Commands::InitConfig { output } => {
+            cmd_init_config(&output)?;
+        }
     }
 
     Ok(())
@@ -86,20 +98,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn cmd_run(config: &Config, interval_secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     let hw = HardwareFingerprint::generate();
-    let effective_id = config.get_effective_device_id(&hw.hwid);
-    let queue_db = QueueDb::new(&config.queue_db_path)?;
+    let profiles = config.active_profiles();
     let client = TelemetryClient::new(&config.server_url)?;
 
     println!("============================================================");
-    println!("     Gerlink TelemetryAgent Client v1.2.0 (Daemon Loop)     ");
+    println!("  Gerlink TelemetryAgent Multi-Brand Daemon (v1.2.0)        ");
     println!("============================================================");
-    println!("Device ID      : {}", effective_id);
-    println!("Software       : {} v{}", config.software_name, config.software_version);
-    println!("Hospital       : {}", config.hospital_name);
-    println!("Reporting DB   : {}", config.db_path);
-    println!("Queue DB       : {}", config.queue_db_path);
-    println!("Target Server  : {}", config.server_url);
-    println!("Sync Interval  : {} seconds", interval_secs);
+    println!("HWID Fingerprint : {}", hw.hwid);
+    println!("Hospital         : {}", config.hospital_name);
+    println!("Target Server    : {}", config.server_url);
+    println!("Sync Interval    : {} seconds", interval_secs);
+    println!("Tracked Brands   : {} profiles active", profiles.len());
+    for (i, p) in profiles.iter().enumerate() {
+        let eff_id = config.get_effective_device_id(p, &hw.hwid);
+        println!(
+            "  [{}] {:<9} v{:<6} | DeviceID: {} | DB: {}",
+            i + 1,
+            p.label(),
+            p.software_version,
+            eff_id,
+            p.db_path
+        );
+    }
     println!("============================================================");
     println!("Press Ctrl+C to stop daemon.\n");
 
@@ -113,51 +133,69 @@ async fn cmd_run(config: &Config, interval_secs: u64) -> Result<(), Box<dyn std:
             }
             _ = interval.tick() => {
                 let timestamp = chrono::Utc::now().to_rfc3339();
-                println!("[{}] Starting telemetry probe and sync cycle...", timestamp);
+                println!("[{}] Starting multi-brand telemetry cycle...", timestamp);
 
-                // 1. Drain offline queue first
-                replay_offline_queue(&queue_db, &client).await;
+                for profile in &profiles {
+                    let brand_label = profile.label();
+                    let queue_db = match QueueDb::new(&profile.queue_db_path) {
+                        Ok(db) => db,
+                        Err(e) => {
+                            eprintln!("[{}] [{}] Failed to open queue DB ({}): {}", timestamp, brand_label, profile.queue_db_path, e);
+                            continue;
+                        }
+                    };
 
-                // 2. Collect current metrics
-                match collector::collect_telemetry(config, &hw.hwid) {
-                    Ok(payload) => {
-                        let json = match serde_json::to_string(&payload) {
-                            Ok(j) => j,
-                            Err(e) => {
-                                eprintln!("[ERROR] JSON serialization failed: {}", e);
-                                continue;
-                            }
-                        };
+                    // 1. Drain offline queue first for this brand
+                    replay_offline_queue(&queue_db, &client, &brand_label).await;
 
-                        // Store in queue table (offline resilience)
-                        let queue_id = match queue_db.enqueue(&json) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                eprintln!("[ERROR] Failed to save payload to local queue DB: {}", e);
-                                continue;
-                            }
-                        };
+                    // 2. Probe current metrics
+                    match collector::collect_telemetry_for_profile(config, profile, &hw.hwid) {
+                        Ok(payload) => {
+                            let json = match serde_json::to_string(&payload) {
+                                Ok(j) => j,
+                                Err(e) => {
+                                    eprintln!("[{}] [{}] JSON serialization failed: {}", timestamp, brand_label, e);
+                                    continue;
+                                }
+                            };
 
-                        // 3. Dispatch to cloaked update-checker endpoint
-                        match client.send_payload(&payload).await {
-                            Ok(resp) => {
-                                let _ = queue_db.mark_synced(queue_id);
-                                println!(
-                                    "[ONLINE] Synced successfully (Queue ID: {}). Server Status: '{}', Update Available: {}, Latest: '{}'",
-                                    queue_id, resp.status, resp.update_available, resp.latest_version
-                                );
-                            }
-                            Err(err) => {
-                                let _ = queue_db.mark_failed(queue_id, &err);
-                                eprintln!(
-                                    "[OFFLINE] Network dispatch failed: {}. Queued in local SQLite (Queue ID: {}) for retry.",
-                                    err, queue_id
-                                );
+                            let queue_id = match queue_db.enqueue(&json) {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    eprintln!("[{}] [{}] Enqueue failed: {}", timestamp, brand_label, e);
+                                    continue;
+                                }
+                            };
+
+                            // 3. Dispatch to server
+                            match client.send_payload(&payload).await {
+                                Ok(resp) => {
+                                    let _ = queue_db.mark_synced(queue_id);
+                                    println!(
+                                        "[{}] [{}] ONLINE: Synced #{} (DevID: {}). Status: '{}', Update: {}",
+                                        timestamp,
+                                        brand_label,
+                                        queue_id,
+                                        payload.device_id,
+                                        resp.status,
+                                        resp.update_available
+                                    );
+                                }
+                                Err(err) => {
+                                    let _ = queue_db.mark_failed(queue_id, &err);
+                                    eprintln!(
+                                        "[{}] [{}] OFFLINE: #{} queued for retry. Reason: {}",
+                                        timestamp,
+                                        brand_label,
+                                        queue_id,
+                                        err
+                                    );
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("[ERROR] Failed to probe telemetry data: {}", e);
+                        Err(e) => {
+                            eprintln!("[{}] [{}] Probe failed: {}", timestamp, brand_label, e);
+                        }
                     }
                 }
             }
@@ -167,49 +205,64 @@ async fn cmd_run(config: &Config, interval_secs: u64) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-async fn cmd_send_once(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_send_once(config: &Config, brand_filter: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let hw = HardwareFingerprint::generate();
-    let effective_id = config.get_effective_device_id(&hw.hwid);
-    let queue_db = QueueDb::new(&config.queue_db_path)?;
+    let all_profiles = config.active_profiles();
     let client = TelemetryClient::new(&config.server_url)?;
 
-    println!("Probing Gerlink TelemetryAgent metrics (single dispatch)...");
-    println!("Device ID      : {}", effective_id);
-    println!("Software       : {} v{}", config.software_name, config.software_version);
-    println!("Target Server  : {}", config.server_url);
-
-    // Replay any earlier unsynced items
-    replay_offline_queue(&queue_db, &client).await;
-
-    // Collect telemetry
-    let payload = collector::collect_telemetry(config, &hw.hwid)?;
-    let json = serde_json::to_string_pretty(&payload)?;
-    println!("\nCollected Payload:\n{}", json);
-
-    let queue_id = queue_db.enqueue(&json)?;
-    println!("\nEnqueued to local offline queue with ID: {}", queue_id);
-
-    print!("Dispatching to cloaked endpoint {} ... ", config.server_url);
-    match client.send_payload(&payload).await {
-        Ok(resp) => {
-            queue_db.mark_synced(queue_id)?;
-            println!("SUCCESS!");
-            println!("Server Response:");
-            println!("  Status           : {}", resp.status);
-            println!("  Update Available : {}", resp.update_available);
-            println!("  Latest Version   : {}", resp.latest_version);
-            if let Some(ts) = resp.server_timestamp {
-                println!("  Server Timestamp : {}", ts);
-            }
-        }
-        Err(err) => {
-            queue_db.mark_failed(queue_id, &err)?;
-            println!("OFFLINE / FAILED");
-            println!(
-                "Note: Telemetry payload saved safely to local queue (ID: {}). It will be re-sent automatically on next run.",
-                queue_id
+    let target_profiles: Vec<&Profile> = if let Some(bf) = brand_filter {
+        let needle = bf.trim().to_uppercase();
+        let filtered: Vec<&Profile> = all_profiles
+            .iter()
+            .filter(|p| p.label().to_uppercase() == needle)
+            .collect();
+        if filtered.is_empty() {
+            eprintln!(
+                "Error: Brand '{}' not found in active profiles. Available: {}",
+                bf,
+                all_profiles.iter().map(|p| p.label()).collect::<Vec<_>>().join(", ")
             );
-            println!("Error detail: {}", err);
+            return Ok(());
+        }
+        filtered
+    } else {
+        all_profiles.iter().collect()
+    };
+
+    println!("Executing single probe for {} profile(s)...", target_profiles.len());
+
+    for profile in target_profiles {
+        let brand_label = profile.label();
+        let effective_id = config.get_effective_device_id(profile, &hw.hwid);
+        let queue_db = QueueDb::new(&profile.queue_db_path)?;
+
+        println!("\n--- Brand: {} (v{}) ---", brand_label, profile.software_version);
+        println!("Device ID      : {}", effective_id);
+        println!("Reporting DB   : {}", profile.db_path);
+        println!("Queue DB       : {}", profile.queue_db_path);
+
+        replay_offline_queue(&queue_db, &client, &brand_label).await;
+
+        let payload = collector::collect_telemetry_for_profile(config, profile, &hw.hwid)?;
+        let json = serde_json::to_string_pretty(&payload)?;
+        println!("Payload snippet: {} bytes", json.len());
+
+        let queue_id = queue_db.enqueue(&json)?;
+        print!("Dispatching to {} ... ", config.server_url);
+
+        match client.send_payload(&payload).await {
+            Ok(resp) => {
+                queue_db.mark_synced(queue_id)?;
+                println!("SUCCESS!");
+                println!("  Status           : {}", resp.status);
+                println!("  Update Available : {}", resp.update_available);
+                println!("  Latest Version   : {}", resp.latest_version);
+            }
+            Err(err) => {
+                queue_db.mark_failed(queue_id, &err)?;
+                println!("OFFLINE / FAILED (saved to queue #{})", queue_id);
+                println!("  Error: {}", err);
+            }
         }
     }
 
@@ -218,46 +271,44 @@ async fn cmd_send_once(config: &Config) -> Result<(), Box<dyn std::error::Error>
 
 fn cmd_status(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let hw = HardwareFingerprint::generate();
-    let effective_id = config.get_effective_device_id(&hw.hwid);
-    let queue_db = QueueDb::new(&config.queue_db_path)?;
-    let stats = queue_db.get_stats()?;
+    let profiles = config.active_profiles();
 
     println!("============================================================");
-    println!("               Gerlink TelemetryAgent Status                ");
+    println!("       Gerlink TelemetryAgent Status (Multi-Brand)          ");
     println!("============================================================");
     println!("Hardware Fingerprint (HWID):");
-    println!("  Effective Device ID : {}", effective_id);
     println!("  Generated HWID      : {}", hw.hwid);
     println!("  CPU                 : {}", hw.cpu);
     println!("  Motherboard UUID    : {}", hw.motherboard_uuid);
     println!("  Primary MAC Address : {}", hw.mac_address);
     println!("  Primary Disk Serial : {}", hw.disk_serial);
-    println!("  Raw Fingerprint     : {}", hw.raw_fingerprint);
     println!();
-    println!("Target Endpoint:");
+    println!("Target Server & Faskes Profile:");
     println!("  Server URL          : {}", config.server_url);
     println!("  User-Agent          : {}", telemetry_agent::client::CLOAKED_USER_AGENT);
-    println!();
-    println!("Software & Faskes Profile:");
-    println!("  Software Name       : {}", config.software_name);
-    println!("  Software Version    : {}", config.software_version);
     println!("  Hospital Name       : {}", config.hospital_name);
     println!("  Region / City       : {}, {}", config.region, config.city);
     println!("  Room Name           : {}", config.room_name);
     println!("  Coordinates         : [{}, {}]", config.latitude, config.longitude);
-    println!();
-    println!("Reporting Database:");
-    println!("  Path                : {}", config.db_path);
-    println!("  File Exists         : {}", Path::new(&config.db_path).exists());
+    println!("  Interval (secs)     : {}", config.interval_secs);
     println!("  Mock Fallback       : {}", config.enable_mock_if_missing);
     println!();
-    println!("Local Offline Queue (SQLite):");
-    println!("  Queue DB Path       : {}", config.queue_db_path);
-    println!("  Total Enqueued      : {}", stats.total);
-    println!("  Synced Successfully : {}", stats.synced);
-    println!("  Unsynced (Pending)  : {}", stats.unsynced);
-    if let Some(ref attempt) = stats.last_attempt {
-        println!("  Last Attempt Time   : {}", attempt);
+    println!("Tracked Brand Profiles ({} total):", profiles.len());
+    for (i, p) in profiles.iter().enumerate() {
+        let eff_id = config.get_effective_device_id(p, &hw.hwid);
+        let exists = Path::new(&p.db_path).exists();
+        let queue_stats = match QueueDb::new(&p.queue_db_path) {
+            Ok(q) => match q.get_stats() {
+                Ok(s) => format!("Queue: {} total, {} synced, {} pending", s.total, s.synced, s.unsynced),
+                Err(_) => "Queue stats error".to_string(),
+            },
+            Err(_) => "Queue DB not initialized".to_string(),
+        };
+
+        println!("  [{}] {} (v{})", i + 1, p.label(), p.software_version);
+        println!("      Effective Device ID : {}", eff_id);
+        println!("      Reporting DB        : {} (exists: {})", p.db_path, exists);
+        println!("      Queue DB            : {} ({})", p.queue_db_path, queue_stats);
     }
     println!("============================================================");
 
@@ -269,7 +320,15 @@ fn cmd_test_db(
     custom_path: Option<&str>,
     seed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let db_path = custom_path.unwrap_or(&config.db_path);
+    let db_path = if let Some(p) = custom_path {
+        p.to_string()
+    } else {
+        let first = config.active_profiles();
+        first
+            .first()
+            .map(|p| p.db_path.clone())
+            .unwrap_or_else(|| r"D:\GLESCOPE_DB\telemetry.db".to_string())
+    };
 
     println!("============================================================");
     println!("          Gerlink Telemetry Reporting DB Inspector          ");
@@ -278,20 +337,20 @@ fn cmd_test_db(
 
     if seed {
         println!("Seeding sample realistic reporting schema & records...");
-        seed_sample_reporting_db(db_path)?;
+        seed_sample_reporting_db(&db_path)?;
         println!("Database seeded successfully at '{}'!\n", db_path);
     }
 
-    if !Path::new(db_path).exists() {
+    if !Path::new(&db_path).exists() {
         println!("Status: NOT FOUND");
         println!(
             "Database file does not exist. Use `--seed` to generate a sample database for testing:"
         );
-        println!("  telemetry-agent test-db --path {} --seed", db_path);
+        println!("  telemetry-agent test-db --path \"{}\" --seed", db_path);
         return Ok(());
     }
 
-    match ReportingDbReader::read(db_path) {
+    match ReportingDbReader::read(&db_path) {
         Ok(data) => {
             println!("Status: CONNECTED & READ SUCCESSFUL\n");
             println!("Usage Metrics:");
@@ -327,50 +386,77 @@ fn cmd_test_db(
 }
 
 async fn cmd_health(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let queue_db = QueueDb::new(&config.queue_db_path)?;
-
-    let detected_errors = if Path::new(&config.db_path).exists() {
-        let rep_data = ReportingDbReader::read(&config.db_path)?;
-        rep_data
-            .detected_errors
-            .into_iter()
-            .map(|e| collector::DetectedError {
-                timestamp: e.timestamp,
-                module: e.module,
-                error_message: e.error_message,
-            })
-            .collect()
-    } else if config.enable_mock_if_missing {
-        collector::generate_mock_metrics().2
-    } else {
-        Vec::new()
-    };
-
-    let report = collect_health_report(config, &queue_db, &detected_errors).await?;
-    let status = calculate_status(&report);
+    let profiles = config.active_profiles();
 
     println!("============================================================");
-    println!("           Gerlink TelemetryAgent Health Report             ");
+    println!("     Gerlink TelemetryAgent Health Report (Multi-Brand)     ");
     println!("============================================================");
-    println!("Status               : {}", status);
-    println!("Uptime               : {:.2} seconds", report.agent_uptime_seconds);
-    println!("Memory RSS           : {:.2} MB", report.memory_rss_mb);
-    println!("CPU Usage            : {:.2} %", report.cpu_pct);
-    println!("Last Sync At         : {:?}", report.last_sync_at);
-    println!("Queue Depth          : {}", report.queue_depth);
-    println!("DB Size              : {:.2} MB", report.db_size_mb);
-    println!("Errors (24h)         : {}", report.error_count_24h);
-    println!("Version              : {}", report.version);
-    println!("Connected to Server  : {}", report.is_connected_to_server);
-    if let Some(ref msg) = report.last_error_message {
-        println!("Last Error Message   : {}", msg);
+
+    for (i, profile) in profiles.iter().enumerate() {
+        let queue_db = QueueDb::new(&profile.queue_db_path)?;
+
+        let detected_errors = if Path::new(&profile.db_path).exists() {
+            match ReportingDbReader::read(&profile.db_path) {
+                Ok(rep) => rep
+                    .detected_errors
+                    .into_iter()
+                    .map(|e| collector::DetectedError {
+                        timestamp: e.timestamp,
+                        module: e.module,
+                        error_message: e.error_message,
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        } else if config.enable_mock_if_missing {
+            collector::generate_mock_metrics().2
+        } else {
+            Vec::new()
+        };
+
+        let report = collect_health_report_for_profile(config, profile, &queue_db, &detected_errors).await?;
+        let status = calculate_status(&report);
+
+        println!("Brand [{}]: {} (v{})", i + 1, profile.label(), profile.software_version);
+        println!("  Overall Status     : {}", status);
+        println!("  Uptime             : {:.2}s", report.agent_uptime_seconds);
+        println!("  Memory RSS         : {:.2} MB", report.memory_rss_mb);
+        println!("  CPU Usage          : {:.2} %", report.cpu_pct);
+        println!("  Queue Depth        : {}", report.queue_depth);
+        println!("  DB Size            : {:.2} MB", report.db_size_mb);
+        println!("  Errors (24h)       : {}", report.error_count_24h);
+        println!("  Connected to Server: {}", report.is_connected_to_server);
+        if let Some(ref last) = report.last_error_message {
+            println!("  Last Error         : {}", last);
+        }
+        println!();
     }
     println!("============================================================");
 
     Ok(())
 }
 
-async fn replay_offline_queue(queue_db: &QueueDb, client: &TelemetryClient) {
+fn cmd_init_config(output_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cfg = Config::default();
+    cfg.profiles = vec![
+        Profile::new_software(SoftwareName::Glescope),
+        Profile::new_software(SoftwareName::Antech),
+        Profile::new_software(SoftwareName::Easttech),
+        Profile::new_software(SoftwareName::Zeus),
+    ];
+
+    let json = serde_json::to_string_pretty(&cfg)?;
+    std::fs::write(output_path, json)?;
+    println!(
+        "Successfully created multi-brand template configuration file at '{}'.",
+        output_path
+    );
+    println!("It tracks 4 brands: Glescope, Antech, Easttech, and Zeus.");
+
+    Ok(())
+}
+
+async fn replay_offline_queue(queue_db: &QueueDb, client: &TelemetryClient, label: &str) {
     let unsynced = match queue_db.get_unsynced() {
         Ok(list) => list,
         Err(_) => return,
@@ -380,18 +466,18 @@ async fn replay_offline_queue(queue_db: &QueueDb, client: &TelemetryClient) {
         return;
     }
 
-    println!("[QUEUE] Found {} unsynced offline records. Attempting replay...", unsynced.len());
+    println!("[{}] [QUEUE] Found {} unsynced offline records. Attempting replay...", label, unsynced.len());
 
     for (id, raw_json) in unsynced {
         match client.send_raw_json(&raw_json).await {
             Ok(_) => {
                 let _ = queue_db.mark_synced(id);
-                println!("[QUEUE] Offline record #{} synced successfully.", id);
+                println!("[{}] [QUEUE] Offline record #{} synced successfully.", label, id);
             }
             Err(e) => {
                 let _ = queue_db.mark_failed(id, &e);
-                println!("[QUEUE] Replay paused: network error on record #{}: {}", id, e);
-                break; // Stop replaying on network failure to avoid hammer
+                println!("[{}] [QUEUE] Replay paused: network error on record #{}: {}", label, id, e);
+                break;
             }
         }
     }

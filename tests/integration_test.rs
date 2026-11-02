@@ -43,10 +43,14 @@ async fn test_end_to_end_dispatch_and_sync() {
 
     let mut cfg = Config::default();
     cfg.server_url = server_url;
-    cfg.db_path = reporting_db.to_str().unwrap().to_string();
-    cfg.queue_db_path = queue_db_path.to_str().unwrap().to_string();
+    let mut default_profile = telemetry_agent::config::Profile::new_software(
+        telemetry_agent::config::SoftwareName::Glescope,
+    );
+    default_profile.db_path = reporting_db.to_str().unwrap().to_string();
+    default_profile.queue_db_path = queue_db_path.to_str().unwrap().to_string();
+    cfg.profiles = vec![default_profile];
 
-    let queue_db = QueueDb::new(&cfg.queue_db_path).unwrap();
+    let queue_db = QueueDb::new(&cfg.active_profiles()[0].queue_db_path).unwrap();
     let client = TelemetryClient::new(&cfg.server_url).unwrap();
 
     // 3. Collect

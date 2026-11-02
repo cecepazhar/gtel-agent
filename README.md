@@ -1,116 +1,150 @@
-# Gerlink TelemetryAgent Client (`gtel-agent`)
+# Gerlink TelemetryAgent Client — Multi-Brand
 
-**Gerlink Telemetry Ecosystem v2.0 Client**  
+**Gerlink Telemetry Ecosystem v2.0 Client (Multi-Brand)**  
 High-performance, sovereign telemetry and background update-checking agent for Gerlink medical endoscopy and surgical reporting stations (**Glescope, Antech, Easttech, Zeus**).
+
+> Opsi B arsitektur: 1 binary track semua brand via `profiles` di `agent_config.json`.
 
 ---
 
 ## Features
 
-- **Single Static Binary:** Written in Rust (2021 edition), compiles cleanly for both Linux and Windows (`x86_64-pc-windows-gnu` / `x86_64-pc-windows-msvc`).
+- **Multi-Brand, Single Binary:** Satu proses daemon bisa meng-track 4 brand (Glescope, Antech, Easttech, Zeus) sekaligus. Tiap brand punya profil DB + queue terpisah.
 - **Hardware Fingerprinting (HWID):**
-  - Generates deterministic, unique machine identity hashing:
-    $$\text{HWID} = \text{DEV-} + \text{SHA256}(\text{CPU} \parallel \text{Motherboard UUID} \parallel \text{MAC} \parallel \text{Disk})[0..16]$$
-  - Linux DMI product UUID / machine-id extraction.
-  - Windows registry `MachineGuid` / WMIC extraction.
+  - Hash determinan `DEV-` + `SHA256(CPU || Motherboard UUID || MAC || Disk)[0..16]`
+  - Windows registry `MachineGuid` / WMIC extraction
+  - Linux DMI product UUID / machine-id
 - **Reporting Database Reader:**
-  - Reads clinical non-PII metrics from local reporting SQLite database (`D:\GLESCOPE_DB\telemetry.db` or configured path):
-    - Software active hours & light source runtime hours
-    - Patient, doctor, examination, and generated report counts
-    - Local medical error and exception logs
-  - Built-in mock generator for non-production environments and development machines.
-- **Cloaked Update-Checker HTTP Dispatcher:**
-  - Endpoint: `POST /v1/update/check` (Default: `https://apig.fathforce.com/v1/update/check`)
-  - Cloaked User-Agent: `GerlinkUpdateService/1.2`
-  - Seamlessly disguises operational and health telemetry as routine software update checks.
+  - Membaca metrik non-PII dari SQLite report tiap brand (`D:\GLESCOPE_DB\telemetry.db`, `D:\ANTECH_DB\telemetry.db`, dsb)
+  - Mock generator untuk PC dev / non-reporting
+- **Cloaked Update-Checker Dispatcher:**
+  - `POST /v1/update/check` (default `https://apig.fathforce.com/v1/update/check`)
+  - User-Agent `GerlinkUpdateService/1.2`
 - **Offline Resilience:**
-  - Local SQLite FIFO queue (`agent_queue.db`) stores telemetry payloads with `synced = 0`.
-  - Automatic replay and syncing when network connectivity is restored.
+  - Tiap brand punya `agent_queue_<brand>.db` (SQLite FIFO)
+  - Replay otomatis saat online
 
 ---
 
-## CLI Interface
+## CLI Commands
 
 ```bash
-# Display hardware fingerprint, target URL, and queue status
-telemetry-agent status
+# Jalankan daemon multi-brand (interval default dari config / 300 detik)
+telemetry-agent run --config agent_config.json
 
-# Run daemon scheduler loop (polls and syncs every N seconds)
-telemetry-agent run --interval 300
+# Eksekusi probe one-shot semua brand
+telemetry-agent send-once --config agent_config.json
 
-# Execute immediate single probe & dispatch
-telemetry-agent send-once
+# Cek status HWID, server, dan 4 profil brand
+telemetry-agent status --config agent_config.json
 
-# Verify SQLite reporting DB connectivity (and optionally seed sample records)
-telemetry-agent test-db --path ./data/telemetry.db --seed
+# Cek health tiap brand
+telemetry-agent health --config agent_config.json
+
+# Generate config template 4 brand
+telemetry-agent init-config --output agent_config.json
+
+# Inspect / seed DB report satu brand
+telemetry-agent test-db --path "D:\GLESCOPE_DB\telemetry.db" --seed
 ```
 
 ---
 
-## JSON Payload Specification
+## Struktur `agent_config.json`
 
 ```json
 {
-  "device_id": "DEV-F6691AD1DAF0D6AB",
-  "software_name": "GLESCOPE",
-  "software_version": "1.2.0",
-  "hospital_info": {
-    "hospital_name": "RSUD Dr. Soetomo",
-    "region": "Jawa Timur",
-    "city": "Surabaya",
-    "room_name": "Poli THT - Ruang Tindakan 2",
-    "latitude": -7.2575,
-    "longitude": 112.7521
-  },
-  "usage_metrics": {
-    "usage_count": 142,
-    "software_active_hours": 328.5,
-    "light_source_hours": 245.0
-  },
-  "productivity_metrics": {
-    "total_patients": 420,
-    "total_doctors": 6,
-    "total_examinations": 890,
-    "total_reports_generated": 885
-  },
-  "detected_errors": [
+  "server_url": "https://apig.fathforce.com/v1/update/check",
+  "hospital_name": "RSUD Dr. Soetomo",
+  "region": "Jawa Timur",
+  "city": "Surabaya",
+  "room_name": "Poli THT - Ruang Tindakan 2",
+  "latitude": -7.2575,
+  "longitude": 112.7521,
+  "interval_secs": 300,
+  "enable_mock_if_missing": true,
+  "profiles": [
     {
-      "timestamp": "2026-10-27T08:14:22Z",
-      "module": "video-stream",
-      "error_message": "Capture card DirectShow timeout on frame grabber"
+      "software_name": "GLESCOPE",
+      "software_version": "1.2.0",
+      "db_path": "D:\\GLESCOPE_DB\\telemetry.db",
+      "queue_db_path": "./agent_queue_glescope.db",
+      "device_id": null
+    },
+    {
+      "software_name": "ANTECH",
+      "software_version": "1.2.0",
+      "db_path": "D:\\ANTECH_DB\\telemetry.db",
+      "queue_db_path": "./agent_queue_antech.db",
+      "device_id": null
+    },
+    {
+      "software_name": "EASTTECH",
+      "software_version": "1.2.0",
+      "db_path": "D:\\EASTTECH_DB\\telemetry.db",
+      "queue_db_path": "./agent_queue_easttech.db",
+      "device_id": null
+    },
+    {
+      "software_name": "ZEUS",
+      "software_version": "1.2.0",
+      "db_path": "D:\\ZEUS_DB\\telemetry.db",
+      "queue_db_path": "./agent_queue_zeus.db",
+      "device_id": null
     }
   ]
 }
 ```
 
----
-
-## Environment Variables
-
-| Variable | Description | Default |
-|---|---|---|
-| `GTEL_SERVER_URL` | Telemetry / update checker endpoint | `https://apig.fathforce.com/v1/update/check` |
-| `GTEL_DEVICE_ID` | Explicit device ID override | Auto HWID |
-| `GTEL_SOFTWARE_NAME` | Brand (`GLESCOPE`, `ANTECH`, `EASTTECH`, `ZEUS`) | `GLESCOPE` |
-| `GTEL_SOFTWARE_VERSION`| Software version string | `1.2.0` |
-| `GTEL_HOSPITAL_NAME` | Healthcare facility name | `RSUD Dr. Soetomo` |
-| `GTEL_REGION` | Province | `Jawa Timur` |
-| `GTEL_CITY` | City / Regency | `Surabaya` |
-| `GTEL_ROOM_NAME` | Operating room / clinic station | `Poli THT - Ruang Tindakan 2` |
-| `GTEL_DB_PATH` | Path to reporting SQLite database | `D:\GLESCOPE_DB\telemetry.db` (Win) / `./data/telemetry.db` |
-| `GTEL_QUEUE_DB_PATH` | Local offline queue SQLite path | `./agent_queue.db` |
-| `GTEL_INTERVAL_SECS` | Daemon tick interval (seconds) | `300` |
-| `GTEL_ENABLE_MOCK` | Fallback mock if reporting DB missing | `true` |
+Aturan:
+- `profiles` kosong → fallback ke profil Glescope default (kompatibilitas lama).
+- `device_id` null → gunakan HWID lokal; jika diisi, override per brand.
+- `server_url`, `hospital_name`, `region`, `city`, `room_name`, `latitude`, `longitude`, `interval_secs`, `enable_mock_if_missing` bersifat **shared** di level atas.
 
 ---
 
-## Verification & Testing
+## Distribusi .exe Multi-PC
+
+- Build:
+  ```bash
+  cargo build --release
+  ```
+- Hasil: `target/release/telemetry-agent.exe` (static binary, tanpa VCRuntime dependensi).
+- Isi paket deploy:
+  ```
+  dist/
+  ├── telemetry-agent.exe
+  ├── agent_config.json
+  └── README.md
+  ```
+- Install: copy ke `C:\ProgramData\Gerlink\telemetry-agent\` (atau sesuai kebutuhan), lalu daftarkan ke Windows Task Scheduler:
+  ```powershell
+  schtasks /Create /SC DAILY /TN "Gerlink TelemetryAgent" /TR "C:\ProgramData\Gerlink\telemetry-agent\telemetry-agent.exe run --config C:\ProgramData\Gerlink\telemetry-agent\agent_config.json"
+  ```
+- Untuk build cross-compile Linux → Windows (GNU) di server zpc:
+  ```bash
+  rustup target add x86_64-pc-windows-gnu
+  cargo build --release --target x86_64-pc-windows-gnu
+  ```
+  Hasil di `target/x86_64-pc-windows-gnu/release/telemetry-agent.exe`.
+
+---
+
+## Environment Variables (legacy, still valid)
+
+`GTEL_SERVER_URL`, `GTEL_DEVICE_ID`, `GTEL_SOFTWARE_NAME`, `GTEL_SOFTWARE_VERSION`, `GTEL_HOSPITAL_NAME`, `GTEL_REGION`, `GTEL_CITY`, `GTEL_ROOM_NAME`, `GTEL_LATITUDE`, `GTEL_LONGITUDE`, `GTEL_DB_PATH`, `GTEL_QUEUE_DB_PATH`, `GTEL_INTERVAL_SECS`, `GTEL_ENABLE_MOCK`
+
+> `GTEL_DB_PATH` / `GTEL_QUEUE_DB_PATH` sekarang hanya mempengaruhi profil **legacy single-profile** ketika `profiles` kosong. Untuk multi-brand, edit `agent_config.json`.
+
+---
+
+## Testing
 
 ```bash
 cargo test
-cargo check
-cargo run -- status
 ```
+
+Menjalankan 20 unit test + 1 integration test (mock HTTP server).
 
 ---
 
